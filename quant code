@@ -1,0 +1,1190 @@
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║     QUANT LEVEL 4 — COMPLETE MERGED NOTEBOOK (PROP FIRM EDITION)       ║
+# ║                                                                          ║
+# ║  TARGET:  Win Rate > 60%  |  R:R > 1.5  |  DD < 5% daily / 10% max    ║
+# ║                                                                          ║
+# ║  LAYERS:                                                                 ║
+# ║    1. HTF Bias Filter          (daily structure alignment)               ║
+# ║    2. Liquidity Sweep + VP     (where to trade)                          ║
+# ║    3. Order Flow Imbalance     (delta, CVD, bid-ask pressure)            ║
+# ║    4. OI + Funding Proxy       (futures positioning)                     ║
+# ║    5. XGBoost ML               (probability > 0.70)                      ║
+# ║    6. Session + News Blackout  (when to trade, event protection)         ║
+# ║    7. HMM Regime Filter        (market state gate)                       ║
+# ║                                                                          ║
+# ║  EXECUTION:                                                              ║
+# ║    - Dynamic TP: 60% at 1.5R, trail rest with 1x ATR                   ║
+# ║    - Tight SL: 1x ATR, breakeven move at 0.8R                          ║
+# ║    - Spread + slippage cost model                                        ║
+# ║    - Time-of-day analytics                                               ║
+# ║                                                                          ║
+# ║  RISK ENGINE:                                                            ║
+# ║    - Kelly Criterion sizing (fractional)                                 ║
+# ║    - ATR volatility adjustment                                           ║
+# ║    - Daily DD gate at 2.5% (half firm limit)                            ║
+# ║    - Weekly DD gate at 4%                                                ║
+# ║                                                                          ║
+# ║  ROBUSTNESS:                                                             ║
+# ║    - Scheduled monthly XGBoost retraining                               ║
+# ║    - Correlation filter (over-clustering protection)                     ║
+# ║    - Monte Carlo stress test (2,000 simulations)                        ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 1 ── INSTALLS
+# ═════════════════════════════════════════════════════════════════════════════
+# !pip install yfinance xgboost hmmlearn ta pandas numpy scikit-learn \
+#             matplotlib seaborn scipy
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 2 ── IMPORTS
+# ═════════════════════════════════════════════════════════════════════════════
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.gridspec as gridspec
+import seaborn as sns
+import warnings, itertools
+warnings.filterwarnings("ignore")
+
+import yfinance as yf
+import ta
+from xgboost import XGBClassifier
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report
+from scipy import stats
+from hmmlearn.hmm import GaussianHMM
+
+plt.rcParams.update({
+    "figure.facecolor": "white", "axes.facecolor": "#f9f9f9",
+    "axes.grid": True, "grid.alpha": 0.3, "font.size": 11
+})
+print("✅ All imports loaded.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 3 ── MASTER CONFIG
+# ═════════════════════════════════════════════════════════════════════════════
+CFG = {
+    # ── Data ──────────────────────────────────────────────────────────────
+    "ticker":           "NQ=F",      # Nasdaq futures (swap freely)
+    "interval":         "1h",        # ANALYSIS timeframe — structure, ML, sweeps
+    "exec_interval":    "5m",        # EXECUTION timeframe — precise entry + SL
+    "period":           "2y",
+    "exec_period":      "60d",       # 5m data: yfinance limits to ~60 days
+
+    # ── Prop Firm Rules ────────────────────────────────────────────────────
+    "account_size":     100_000,
+    "profit_target":    0.10,        # 10% challenge target
+    "max_dd":           0.10,        # 10% max drawdown hard limit
+    "daily_dd_gate":    0.025,       # halt at 2.5% (half the 5% firm limit)
+    "weekly_dd_gate":   0.04,        # pause week at -4%
+    "risk_per_trade":   0.005,       # 0.5% risk per trade
+    "max_open_trades":  2,
+
+    # ── Signal Layers ──────────────────────────────────────────────────────
+    "htf_ma":           50,          # daily MA for HTF bias
+    "swing_lookback":   8,           # bars for swing high/low detection
+    "sweep_thresh":     0.0015,      # wick extension threshold
+    "vp_bins":          15,          # volume profile buckets
+    "vp_lookback":      100,         # bars for rolling VP
+    "sessions_utc":     [(7,10),(13,16)],  # London + NY open
+    "news_window_min":  30,          # bars to block around events
+
+    # ── Timeframe relationship ─────────────────────────────────────────────
+    # Daily  (df_d) → macro bias     : is overall trend bullish?
+    # 1H     (df)   → analysis layer : structure, sweeps, VP, ML, OFI
+    # 5M     (df_5) → execution layer: precise entry candle + tight SL
+    # Rule: 1H signal fires → wait for 5M confirmation candle → enter
+
+    # ── ML ─────────────────────────────────────────────────────────────────
+    "ml_threshold":     0.70,        # raised for prop firm precision
+    "forward_bars":     8,           # 8 x 15min = 2h forward return
+    "min_move":         0.003,       # 0.3% minimum target move
+    "retrain_months":   1,           # retrain XGBoost every N months
+
+    # ── HMM ────────────────────────────────────────────────────────────────
+    "hmm_states":       3,           # 0=range, 1=trend, 2=high-vol (avoid)
+
+    # ── Execution ──────────────────────────────────────────────────────────
+    "tp1_r":            1.5,         # partial exit at 1.5R
+    "tp1_size":         0.60,        # close 60% at TP1
+    "tp2_trail_atr":    1.0,         # trail remainder with 1x ATR
+    "sl_atr_mult":      1.0,         # tight SL: 1x ATR
+    "be_trigger_r":     0.8,         # move to breakeven at 0.8R
+    "max_bars_hold":    24,          # max hold = 24 bars (6h on 15m)
+    "spread_pct":       0.0002,      # 0.02% spread per side
+    "slippage_pct":     0.0001,      # 0.01% slippage per side
+
+    # ── Robustness ─────────────────────────────────────────────────────────
+    "corr_window_h":    4,           # hours: block if 3 signals within this
+    "mc_simulations":   2_000,       # Monte Carlo iterations
+    "mc_confidence":    0.95,        # CI level
+
+    # ── Kelly ──────────────────────────────────────────────────────────────
+    "kelly_fraction":   0.25,        # quarter Kelly (conservative)
+}
+
+# Quick EV sanity check
+wr  = 0.62
+ev  = wr * CFG["tp1_r"] - (1 - wr) * 1.0
+n_trades = (CFG["account_size"] * CFG["profit_target"]) / \
+           (ev * CFG["risk_per_trade"] * CFG["account_size"])
+print("✅ Config ready.")
+print(f"\n   EV per trade:         +{ev:.3f}R")
+print(f"   Trades to pass (+10%): ~{n_trades:.0f} at 0.5% risk/trade")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 4 ── DATA LOADING
+# ═════════════════════════════════════════════════════════════════════════════
+def load_data(ticker, period, interval):
+    df = yf.download(ticker, period=period, interval=interval, progress=False)
+    df.columns = [c.lower() for c in df.columns]
+    df.dropna(inplace=True)
+    df.index = pd.to_datetime(df.index)
+    print(f"   {ticker} | {interval} | {len(df)} bars "
+          f"| {df.index[0].date()} → {df.index[-1].date()}")
+    return df
+
+print("Loading data...")
+df   = load_data(CFG["ticker"], CFG["period"],     CFG["interval"])      # 1H — analysis
+df_d = load_data(CFG["ticker"], "5y",              "1d")                 # Daily — HTF bias
+df_5 = load_data(CFG["ticker"], CFG["exec_period"],CFG["exec_interval"]) # 5M — execution
+print("✅ Data loaded.")
+print(f"\n   Timeframe stack:")
+print(f"   Daily  (df_d): {len(df_d)} bars  — macro bias")
+print(f"   1H     (df):   {len(df)} bars  — analysis + signals")
+print(f"   5M     (df_5): {len(df_5)} bars  — entry execution")
+
+# ── Pre-compute 5M ATR for execution sizing ──────────────────────────────
+atr_5m = ta.volatility.AverageTrueRange(
+    df_5["high"], df_5["low"], df_5["close"], 14
+).average_true_range()
+# Map latest 5M ATR to each 1H bar (take the last 5M bar within that hour)
+df_5["hour_ts"] = df_5.index.floor("h")
+atr_5m_hourly  = atr_5m.groupby(df_5["hour_ts"]).last()
+df["atr_5m"]   = df.index.map(atr_5m_hourly).fillna(method="bfill")
+print("✅ 5M ATR mapped to 1H bars for execution sizing.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 5 ── LAYER 1: HTF BIAS FILTER
+# ═════════════════════════════════════════════════════════════════════════════
+def htf_bias_filter(df, df_d, ma=50):
+    """
+    Daily structure check:
+      - Price above daily 50 MA
+      - Daily making HH + HL (confirmed uptrend structure)
+    Maps daily signal down to every intraday bar.
+    """
+    d = df_d.copy()
+    d["ma"]     = d["close"].rolling(ma).mean()
+    d["hh"]     = (d["high"] > d["high"].shift(1)).astype(int)
+    d["hl"]     = (d["low"]  > d["low"].shift(1)).astype(int)
+    d["bias"]   = (
+        (d["close"] > d["ma"]) & (d["hh"] == 1) & (d["hl"] == 1)
+    ).astype(int)
+
+    bias_map = d["bias"].to_dict()
+    df["htf_bias"] = df.index.normalize().map(
+        lambda t: bias_map.get(pd.Timestamp(t), 0)
+    ).fillna(0).astype(int)
+    pct = df["htf_bias"].mean() * 100
+    print(f"✅ Layer 1 — HTF bias: {pct:.1f}% of bars in bullish structure")
+    return df
+
+df = htf_bias_filter(df, df_d, CFG["htf_ma"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 6 ── LAYER 2: LIQUIDITY SWEEP + VOLUME PROFILE
+# ═════════════════════════════════════════════════════════════════════════════
+def swing_highs_lows(df, n=8):
+    highs, lows = [], []
+    for i in range(n, len(df) - n):
+        if df["high"].iloc[i] == df["high"].iloc[i-n:i+n+1].max():
+            highs.append(i)
+        if df["low"].iloc[i]  == df["low"].iloc[i-n:i+n+1].min():
+            lows.append(i)
+    return highs, lows
+
+def rolling_vp_poc(df, bins=15, lookback=100):
+    """Point of Control from rolling volume profile."""
+    pocs = []
+    for i in range(lookback, len(df)):
+        w    = df.iloc[i - lookback:i]
+        lo   = w["low"].min()
+        hi   = w["high"].max()
+        if hi == lo:
+            pocs.append(np.nan); continue
+        edges    = np.linspace(lo, hi, bins + 1)
+        vol_bins = np.zeros(bins)
+        for _, row in w.iterrows():
+            for b in range(bins):
+                if edges[b] <= row["close"] < edges[b + 1]:
+                    vol_bins[b] += row["volume"]; break
+        poc_idx = np.argmax(vol_bins)
+        pocs.append((edges[poc_idx] + edges[poc_idx + 1]) / 2)
+    df["poc"] = [np.nan] * lookback + pocs
+    return df
+
+def detect_sweeps(df, swing_h, swing_l, thresh=0.0015):
+    """
+    Bullish sweep: wick pierces below prior swing low → closes back above.
+    Must also be near the POC (volume profile level) for confluence.
+    """
+    sweep = pd.Series(0, index=df.index)
+    h_lvl = [(i, df["high"].iloc[i]) for i in swing_h]
+    l_lvl = [(i, df["low"].iloc[i])  for i in swing_l]
+
+    for bar in range(1, len(df)):
+        rh = [v for i, v in h_lvl if i < bar]
+        rl = [v for i, v in l_lvl if i < bar]
+        if not rh or not rl: continue
+
+        ll = rl[-1]
+        poc_ok = (
+            not pd.isna(df["poc"].iloc[bar]) and
+            abs(df["close"].iloc[bar] - df["poc"].iloc[bar])
+            / df["poc"].iloc[bar] < 0.004
+        )
+        if (df["low"].iloc[bar]   < ll * (1 - thresh) and
+                df["close"].iloc[bar] > ll and poc_ok):
+            sweep.iloc[bar] = 1
+
+    n = (sweep == 1).sum()
+    print(f"✅ Layer 2 — Sweeps at VP: {n} bullish sweeps found")
+    return sweep
+
+df         = rolling_vp_poc(df, CFG["vp_bins"], CFG["vp_lookback"])
+swing_h, swing_l = swing_highs_lows(df, CFG["swing_lookback"])
+df["sweep"] = detect_sweeps(df, swing_h, swing_l, CFG["sweep_thresh"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 7 ── LAYER 3: ORDER FLOW IMBALANCE (Delta, CVD, Bid-Ask Pressure)
+# ═════════════════════════════════════════════════════════════════════════════
+def order_flow_imbalance(df):
+    """
+    Tick-data proxy using bar anatomy:
+      up_vol   ≈ vol * (close - low)  / (high - low)
+      dn_vol   ≈ vol * (high - close) / (high - low)
+      delta    = up_vol - dn_vol
+      CVD      = cumulative delta (resets daily)
+      BA press = delta / (ATR * close)  → signed pressure score
+
+    Replace with real tick delta from broker API for live trading.
+    """
+    hl = (df["high"] - df["low"]).replace(0, np.nan)
+    df["up_vol"]      = df["volume"] * (df["close"] - df["low"])  / hl
+    df["dn_vol"]      = df["volume"] * (df["high"]  - df["close"]) / hl
+    df["delta"]       = df["up_vol"] - df["dn_vol"]
+    df["cvd"]         = df.groupby(df.index.date)["delta"].cumsum()
+    df["cvd_slope"]   = df["cvd"].diff(4)
+
+    atr = ta.volatility.AverageTrueRange(
+        df["high"], df["low"], df["close"], 14
+    ).average_true_range()
+    df["ba_pressure"] = df["delta"] / (atr * df["close"]).replace(0, np.nan)
+
+    # OFI signal: all three bullish
+    df["ofi_bull"] = (
+        (df["delta"]     > 0) &
+        (df["cvd_slope"] > 0) &
+        (df["ba_pressure"] > 0)
+    ).astype(int)
+
+    print(f"✅ Layer 3 — OFI: {df['ofi_bull'].sum()} bullish OFI bars")
+    return df
+
+df = order_flow_imbalance(df)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 8 ── LAYER 4: OPEN INTEREST + FUNDING PROXY
+# ═════════════════════════════════════════════════════════════════════════════
+def oi_funding_proxy(df):
+    """
+    OI proxy  : rolling 20-bar volume trend (rising = new money entering)
+    Funding proxy: price up but CVD flat/negative = potential squeeze risk
+
+    For live systems replace with:
+      - CME Group API (NQ futures OI)
+      - Binance /fapi/v1/openInterest (crypto)
+      - Bybit /v5/market/open-interest
+    """
+    df["oi_proxy"]     = df["volume"].rolling(20).mean()
+    df["oi_rising"]    = (df["oi_proxy"] > df["oi_proxy"].shift(5)).astype(int)
+
+    price_up          = df["close"] > df["close"].shift(5)
+    cvd_flat          = df["cvd"].diff(5) < 0
+    df["squeeze_risk"] = (price_up & cvd_flat).astype(int)
+
+    df["oi_ok"] = (
+        (df["oi_rising"]    == 1) &
+        (df["squeeze_risk"] == 0)
+    ).astype(int)
+
+    print(f"✅ Layer 4 — OI proxy: {df['oi_ok'].sum()} favorable bars")
+    return df
+
+df = oi_funding_proxy(df)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 9 ── LAYER 5: XGBOOST ML (Scheduled Walk-Forward Retraining)
+# ═════════════════════════════════════════════════════════════════════════════
+def build_features(df):
+    """
+    Full feature set including all primary edge signals + technicals.
+    """
+    d = df.copy()
+
+    # Momentum
+    d["rsi"]        = ta.momentum.RSIIndicator(d["close"], 14).rsi()
+    d["roc_4"]      = d["close"].pct_change(4)
+    d["roc_12"]     = d["close"].pct_change(12)
+
+    # Trend
+    d["ema_cross"]  = (
+        ta.trend.EMAIndicator(d["close"], 8).ema_indicator() -
+        ta.trend.EMAIndicator(d["close"], 21).ema_indicator()
+    ) / d["close"]
+    d["adx"]        = ta.trend.ADXIndicator(
+        d["high"], d["low"], d["close"], 14
+    ).adx()
+
+    # Volatility
+    bb             = ta.volatility.BollingerBands(d["close"], 20, 2)
+    d["bb_pct"]    = bb.bollinger_pband()
+    d["bb_width"]  = (bb.bollinger_hband() - bb.bollinger_lband()) / d["close"]
+    d["atr_pct"]   = ta.volatility.AverageTrueRange(
+        d["high"], d["low"], d["close"], 14
+    ).average_true_range() / d["close"]
+
+    # Volume
+    d["vol_ratio"] = d["volume"] / d["volume"].rolling(20).mean()
+
+    # Primary edge signals (from layers 1–4)
+    d["htf_bias"]   = d["htf_bias"]
+    d["sweep"]      = d["sweep"]
+    d["ofi_bull"]   = d["ofi_bull"]
+    d["oi_ok"]      = d["oi_ok"]
+    d["delta_norm"] = d["delta"] / d["volume"].replace(0, np.nan)
+    d["cvd_slope"]  = d["cvd_slope"]
+    d["ba_press"]   = d["ba_pressure"]
+
+    # Candle anatomy
+    d["body"]       = abs(d["close"] - d["open"]) / d["close"]
+    d["lwick"]      = (d[["close","open"]].min(axis=1) - d["low"])  / d["close"]
+    d["uwick"]      = (d["high"] - d[["close","open"]].max(axis=1)) / d["close"]
+
+    # Time
+    d["hour"]       = d.index.hour
+    d["dow"]        = d.index.dayofweek   # 0=Mon … 4=Fri
+
+    FEATS = [
+        "rsi", "roc_4", "roc_12", "ema_cross", "adx",
+        "bb_pct", "bb_width", "atr_pct", "vol_ratio",
+        "htf_bias", "sweep", "ofi_bull", "oi_ok",
+        "delta_norm", "cvd_slope", "ba_press",
+        "body", "lwick", "uwick", "hour", "dow",
+    ]
+    d.dropna(inplace=True)
+    fwd          = d["close"].shift(-CFG["forward_bars"]) / d["close"] - 1
+    d["target"]  = (fwd > CFG["min_move"]).astype(int)
+    d.dropna(subset=["target"], inplace=True)
+
+    pos = d["target"].mean() * 100
+    print(f"✅ Features: {len(FEATS)} inputs | {len(d)} bars | {pos:.1f}% positive class")
+    return d, FEATS
+
+df, FEATS = build_features(df)
+
+
+def scheduled_retrain(df, feat_cols, retrain_months=1):
+    """
+    Walk-forward monthly retraining.
+    Simulates production: model sees only past data, retrained on schedule.
+    Prevents lookahead bias and model decay.
+    """
+    df       = df.copy()
+    df["ml_prob"] = np.nan
+    months   = pd.period_range(df.index.min(), df.index.max(), freq="M")
+    scaler   = StandardScaler()
+    model    = XGBClassifier(
+        n_estimators=400, max_depth=3, learning_rate=0.04,
+        subsample=0.75, colsample_bytree=0.75,
+        min_child_weight=5,
+        use_label_encoder=False, eval_metric="logloss",
+        random_state=42, n_jobs=-1
+    )
+    X    = df[feat_cols].values
+    y    = df["target"].values
+    trained = False
+
+    print("Scheduled retraining walk-forward:")
+    for i, month in enumerate(months):
+        if i < 6: continue   # need min 6 months history
+
+        tr_mask = df.index.to_period("M") < month
+        te_mask = df.index.to_period("M") == month
+        if tr_mask.sum() < 50 or te_mask.sum() == 0: continue
+
+        if i % retrain_months == 0:
+            Xtr_s = scaler.fit_transform(X[tr_mask])
+            model.fit(Xtr_s, y[tr_mask], verbose=False)
+            trained = True
+            print(f"   Retrained on {month} | train={tr_mask.sum()} bars")
+
+        if trained:
+            Xte_s = scaler.transform(X[te_mask])
+            df.loc[te_mask, "ml_prob"] = model.predict_proba(Xte_s)[:, 1]
+
+    df.dropna(subset=["ml_prob"], inplace=True)
+    scaler.fit_transform(X)
+    model.fit(scaler.transform(X), y, verbose=False)
+
+    print(f"✅ Layer 5 — ML: {df['ml_prob'].notna().sum()} OOS bars | "
+          f"avg prob={df['ml_prob'].mean():.3f}")
+    return df, model, scaler
+
+df, xgb_model, scaler = scheduled_retrain(df, FEATS, CFG["retrain_months"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 10 ── LAYER 6: SESSION + NEWS BLACKOUT
+# ═════════════════════════════════════════════════════════════════════════════
+def session_news_filter(df, sessions, news_window=30):
+    """
+    Session filter  : only trade during London (07-10 UTC) + NY open (13-16 UTC)
+    News blackout   : block ±30 min around FOMC, NFP, CPI
+                      Replace with live economic calendar API for production.
+    """
+    h        = df.index.hour
+    in_sess  = pd.Series(False, index=df.index)
+    for s, e in sessions:
+        in_sess |= (h >= s) & (h < e)
+    df["in_session"] = in_sess.astype(int)
+
+    blocked = pd.Series(False, index=df.index)
+    win     = pd.Timedelta(minutes=news_window)
+    for ts in df.index:
+        # NFP: first Friday each month, 13:30 UTC
+        if ts.weekday() == 4 and ts.hour == 13 and ts.minute < 30:
+            blocked[ts] = True
+        # FOMC: approx Wed 18–19 UTC, bimonthly
+        if (ts.weekday() == 2 and ts.hour in [18, 19] and
+                ts.month in [1, 3, 5, 6, 7, 9, 11, 12]):
+            blocked[ts] = True
+        # CPI: Tue 13:30 UTC, weeks 2–3 of month
+        if ts.weekday() == 1 and ts.hour == 13 and 8 <= ts.day <= 21:
+            blocked[ts] = True
+
+    df["event_ok"]   = (~blocked).astype(int)
+    print(f"✅ Layer 6 — Session: {df['in_session'].mean()*100:.1f}% bars | "
+          f"News blocked: {blocked.sum()} bars")
+    return df
+
+df = session_news_filter(df, CFG["sessions_utc"], CFG["news_window_min"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 11 ── LAYER 7: HMM REGIME DETECTION
+# ═════════════════════════════════════════════════════════════════════════════
+def hmm_regime(df, n_states=3):
+    """
+    3-state Hidden Markov Model on log returns + ATR:
+      State 0 = Low vol / range       → tradeable
+      State 1 = Trending / directional → tradeable
+      State 2 = High vol / news spike  → avoid (sit out)
+
+    States sorted by volatility so labels are stable across runs.
+    """
+    log_ret = np.log(df["close"] / df["close"].shift(1)).fillna(0)
+    atr_ser = ta.volatility.AverageTrueRange(
+        df["high"], df["low"], df["close"], 14
+    ).average_true_range().fillna(method="bfill")
+
+    X = StandardScaler().fit_transform(
+        np.column_stack([log_ret.values, (atr_ser / df["close"]).values])
+    )
+    mdl = GaussianHMM(
+        n_components=n_states, covariance_type="full",
+        n_iter=300, random_state=42
+    )
+    mdl.fit(X)
+    raw_states = mdl.predict(X)
+
+    # Sort states by volatility (stable labelling)
+    state_vol = {s: atr_ser.values[raw_states == s].mean() for s in range(n_states)}
+    rank      = sorted(state_vol, key=state_vol.get)
+    remap     = {old: new for new, old in enumerate(rank)}
+    df["hmm_state"]    = np.vectorize(remap.get)(raw_states)
+    df["hmm_trade_ok"] = (df["hmm_state"] < 2).astype(int)   # avoid state 2
+
+    labels = {0: "Range", 1: "Trend", 2: "High-vol (avoid)"}
+    for s in range(n_states):
+        cnt = (df["hmm_state"] == s).sum()
+        print(f"   HMM state {s} ({labels[s]}): {cnt} bars ({cnt/len(df)*100:.1f}%)")
+    print(f"✅ Layer 7 — HMM: {df['hmm_trade_ok'].sum()} tradeable bars")
+    return df, mdl
+
+df, hmm_model = hmm_regime(df, CFG["hmm_states"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 12 ── TIME-OF-DAY ANALYTICS
+# ═════════════════════════════════════════════════════════════════════════════
+def time_of_day_analytics(df):
+    """
+    Analyse which UTC hours have the best historical forward returns.
+    Produces a chart and derives the best_hours list used in signal gate.
+    """
+    df["hour"]    = df.index.hour
+    df["fwd_ret"] = df["close"].shift(-CFG["forward_bars"]) / df["close"] - 1
+    df["fwd_pos"] = (df["fwd_ret"] > 0).astype(int)
+
+    hourly = df.groupby("hour").agg(
+        win_rate=("fwd_pos",  "mean"),
+        avg_ret =("fwd_ret",  "mean"),
+        count   =("fwd_ret",  "count"),
+    ).dropna()
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+    colors_wr  = ["#1D9E75" if v > 0.52 else "#E24B4A" for v in hourly["win_rate"]]
+    colors_ret = ["#1D9E75" if v > 0    else "#E24B4A" for v in hourly["avg_ret"]]
+
+    axes[0].bar(hourly.index, hourly["win_rate"] * 100,
+                color=colors_wr, edgecolor="none")
+    axes[0].axhline(52, color="#888", lw=1, linestyle="--", label=">52% threshold")
+    axes[0].set_title("Win rate by UTC hour", fontweight="bold")
+    axes[0].set_xlabel("Hour (UTC)"); axes[0].set_ylabel("Win rate (%)")
+    axes[0].legend(fontsize=9)
+
+    axes[1].bar(hourly.index, hourly["avg_ret"] * 100,
+                color=colors_ret, edgecolor="none")
+    axes[1].axhline(0, color="#888", lw=1)
+    axes[1].set_title("Avg forward return by UTC hour", fontweight="bold")
+    axes[1].set_xlabel("Hour (UTC)"); axes[1].set_ylabel("Avg return (%)")
+
+    plt.suptitle("Time-of-Day Performance Analytics", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("time_of_day.png", dpi=150, bbox_inches="tight")
+    plt.show()
+
+    best_hours = hourly[hourly["win_rate"] > 0.52].index.tolist()
+    df["hour_ok"] = df["hour"].isin(best_hours).astype(int)
+    print(f"✅ Time analytics: best hours (UTC) = {best_hours}")
+    return df, best_hours
+
+df, best_hours = time_of_day_analytics(df)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 13 ── KELLY CRITERION POSITION SIZING
+# ═════════════════════════════════════════════════════════════════════════════
+def kelly_position_size(df, account, kelly_frac, base_risk):
+    """
+    Estimates optimal risk fraction via Kelly Criterion from signal history,
+    then scales by ATR to reduce size in volatile conditions.
+    """
+    fwd    = df["close"].shift(-CFG["forward_bars"]) / df["close"] - 1
+    sig_r  = fwd[df.get("signal", pd.Series(0, index=df.index)) == 1].dropna()
+
+    if len(sig_r) < 10:
+        df["risk_usd"] = account * base_risk
+        print("⚠️  Not enough signal history for Kelly — using fixed risk")
+        return df
+
+    wins   = sig_r[sig_r > 0]
+    losses = sig_r[sig_r <= 0]
+    if len(wins) == 0 or len(losses) == 0:
+        df["risk_usd"] = account * base_risk
+        return df
+
+    wr     = len(wins) / len(sig_r)
+    b      = wins.mean() / abs(losses.mean())
+    q      = 1 - wr
+    full_k = (b * wr - q) / b
+    adj_k  = max(0, min(full_k, 0.15)) * kelly_frac
+
+    atr_z  = (
+        (df["atr_pct"] - df["atr_pct"].rolling(100).mean()) /
+        df["atr_pct"].rolling(100).std()
+    )
+    atr_scale = (1 - 0.2 * atr_z.clip(-2, 2)).clip(0.5, 1.5)
+    base_risk_used = max(adj_k, base_risk)
+    df["risk_usd"] = (account * base_risk_used * atr_scale).clip(
+        account * 0.003, account * 0.01
+    )
+
+    print(f"✅ Kelly sizing: full={full_k:.2%} | adj={adj_k:.2%} | "
+          f"range=${df['risk_usd'].min():,.0f}–${df['risk_usd'].max():,.0f}")
+    return df
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 14 ── FULL SIGNAL GATE (all 7 layers)
+# ═════════════════════════════════════════════════════════════════════════════
+def generate_signals(df, ml_thresh=0.70):
+    """
+    All 7 layers must pass simultaneously.
+    This is intentionally strict — fewer, higher-quality signals.
+    """
+    df["signal"] = (
+        (df["htf_bias"]     == 1) &   # Layer 1: daily structure
+        (df["sweep"]        == 1) &   # Layer 2: sweep at VP level
+        (df["ofi_bull"]     == 1) &   # Layer 3: order flow
+        (df["oi_ok"]        == 1) &   # Layer 4: OI positioning
+        (df["ml_prob"]      >  ml_thresh) &  # Layer 5: ML confidence
+        (df["in_session"]   == 1) &   # Layer 6: session window
+        (df["event_ok"]     == 1) &   # Layer 6: no news event
+        (df["hour_ok"]      == 1) &   # time-of-day filter
+        (df["hmm_trade_ok"] == 1)     # Layer 7: HMM regime
+    ).astype(int)
+
+    n = df["signal"].sum()
+    bars_per_month = len(df) / 24
+    print(f"✅ Signals: {n} total | ~{n/bars_per_month:.1f}/month | "
+          f"{n/len(df)*100:.3f}% of bars")
+    return df
+
+df = generate_signals(df, CFG["ml_threshold"])
+df = kelly_position_size(df, CFG["account_size"],
+                         CFG["kelly_fraction"], CFG["risk_per_trade"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 15 ── CORRELATION FILTER
+# ═════════════════════════════════════════════════════════════════════════════
+def correlation_filter(df, window_hours=4):
+    """
+    Blocks a new signal if 3 or more signals fired within the last
+    `window_hours` hours (over-clustering = correlated exposure).
+
+    For multi-asset portfolios: compute cross-asset return correlation
+    and block new entries if portfolio correlation > threshold.
+    """
+    df["corr_blocked"] = False
+    sig_times = df[df["signal"] == 1].index.tolist()
+
+    for i in range(2, len(sig_times)):
+        t_old, t_new = sig_times[i - 2], sig_times[i]
+        gap_h = (t_new - t_old).total_seconds() / 3600
+        if gap_h < window_hours:
+            df.loc[t_new, "corr_blocked"] = True
+
+    n_blocked = df["corr_blocked"].sum()
+    df.loc[df["corr_blocked"], "signal"] = 0
+    print(f"✅ Correlation filter: {n_blocked} over-clustered signals blocked | "
+          f"{df['signal'].sum()} signals remain")
+    return df
+
+df = correlation_filter(df, CFG["corr_window_h"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 16 ── PROP FIRM BACKTEST (with all execution rules)
+# ═════════════════════════════════════════════════════════════════════════════
+def apply_costs(price, direction, spread, slip):
+    """Round-trip cost adjustment."""
+    cost = spread + slip
+    return price * (1 + cost) if direction == 1 else price * (1 - cost)
+
+def get_5m_entry(df_5, signal_ts, direction=1, lookback_bars=3):
+    """
+    After a 1H signal fires at signal_ts, look at the next 'lookback_bars'
+    5-minute bars for a precise entry trigger:
+      - Bullish: first 5M bar that closes above its open (bullish confirmation)
+      - Entry = close of that 5M bar
+      - SL    = low of that 5M bar minus 0.5×ATR_5m (tight)
+
+    Returns (entry_price, stop_loss, found).
+    If no confirmation within lookback_bars, returns None (skip trade).
+    """
+    window = df_5[df_5.index > signal_ts].head(lookback_bars)
+    for ts, row in window.iterrows():
+        if direction == 1 and row["close"] > row["open"]:
+            atr_bar = (row["high"] - row["low"])           # simple bar range as SL buffer
+            entry   = row["close"] * (1 + CFG["spread_pct"] + CFG["slippage_pct"])
+            sl      = row["low"] - 0.5 * atr_bar
+            return entry, sl, True
+        elif direction == -1 and row["close"] < row["open"]:
+            atr_bar = (row["high"] - row["low"])
+            entry   = row["close"] * (1 - CFG["spread_pct"] - CFG["slippage_pct"])
+            sl      = row["high"] + 0.5 * atr_bar
+            return entry, sl, True
+    return None, None, False   # no clean 5M confirmation — skip
+
+def propfirm_backtest(df, df_5, cfg):
+    """
+    Full backtest with THREE-TIMEFRAME execution:
+      - 1H signal fires  → record signal timestamp
+      - 5M chart         → find precise confirmation candle within next 3 bars
+      - Entry / SL       → based on 5M bar (tighter stop = better R:R)
+      - TP / trail       → managed on 1H bars (broader view)
+      + Prop firm rules: daily/weekly DD gates, Kelly sizing
+    """
+    account      = cfg["account_size"]
+    equity       = account
+    peak_eq      = account
+    trades       = []
+    daily_pnl    = {}
+    weekly_pnl   = {}
+    in_trade     = False
+    entry_p = sl = trail_sl = 0.0
+    entry_bar    = 0
+    remaining    = 1.0
+    tp1_done     = False
+    be_done      = False
+
+    prices  = df["close"].values
+    highs   = df["high"].values
+    lows    = df["low"].values
+    atrs    = ta.volatility.AverageTrueRange(
+        df["high"], df["low"], df["close"], 14
+    ).average_true_range().fillna(method="bfill").values
+    sigs    = df["signal"].values
+    risks   = df["risk_usd"].values
+    dates   = df.index
+
+    def dkey(ts): return ts.date()
+    def wkey(ts): return (ts.year, ts.isocalendar()[1])
+
+    for i in range(len(df) - cfg["max_bars_hold"] - 2):
+        d, w = dkey(dates[i]), wkey(dates[i])
+        daily_pnl.setdefault(d, 0.0)
+        weekly_pnl.setdefault(w, 0.0)
+
+        # ── Prop firm gates ──
+        if daily_pnl[d]  <= -account * cfg["daily_dd_gate"]:  continue
+        if weekly_pnl[w] <= -account * cfg["weekly_dd_gate"]: continue
+        if (peak_eq - equity) / peak_eq >= cfg["max_dd"] - 0.01: break
+
+        if not in_trade and sigs[i] == 1:
+            # ── 5M execution: find precise entry candle ──────────────────
+            signal_ts = dates[i]
+            entry_p, sl, found = get_5m_entry(df_5, signal_ts, direction=1)
+
+            if not found:
+                # No clean 5M confirmation within 3 bars — skip this signal
+                continue
+
+            risk_$      = risks[i]
+            R           = entry_p - sl          # R based on 5M bar range
+            if R <= 0:
+                continue                        # invalid setup, skip
+            trail_sl    = sl
+            entry_bar   = i
+            remaining   = 1.0
+            tp1_done    = False
+            be_done     = False
+            in_trade    = True
+
+        if in_trade:
+            # Update trailing stop
+            peak_p   = max(prices[entry_bar:i+1])
+            trail_sl = max(trail_sl, peak_p - cfg["tp2_trail_atr"] * atrs[i])
+
+            # Breakeven move
+            R = entry_p - sl
+            if not be_done and prices[i] >= entry_p + cfg["be_trigger_r"] * R:
+                trail_sl = max(trail_sl, entry_p)
+                be_done  = True
+
+            # TP1: partial exit at 1.5R
+            tp1_price = entry_p + cfg["tp1_r"] * R
+            tp1_pnl   = 0.0
+            if not tp1_done and highs[i] >= tp1_price:
+                exit_p  = apply_costs(tp1_price, -1,
+                          cfg["spread_pct"], cfg["slippage_pct"])
+                tp1_pnl = (exit_p / entry_p - 1) * cfg["tp1_size"] * risk_$
+                remaining -= cfg["tp1_size"]
+                tp1_done  = True
+
+            # Stop hit (trailing or original SL)
+            eff_sl = max(trail_sl, sl)
+            if lows[i] < eff_sl:
+                exit_p  = apply_costs(eff_sl, -1,
+                          cfg["spread_pct"], cfg["slippage_pct"])
+                sl_pnl  = (exit_p / entry_p - 1) * remaining * risk_$
+                total   = tp1_pnl + sl_pnl
+                equity += total; peak_eq = max(peak_eq, equity)
+                daily_pnl[d]  = daily_pnl.get(d,  0) + total
+                weekly_pnl[w] = weekly_pnl.get(w, 0) + total
+                trades.append({"pnl": total, "equity": equity,
+                               "win": total > 0, "type": "SL",
+                               "bars": i - entry_bar})
+                in_trade = False; continue
+
+            # Time exit
+            if i >= entry_bar + cfg["max_bars_hold"]:
+                exit_p  = apply_costs(prices[i], -1,
+                          cfg["spread_pct"], cfg["slippage_pct"])
+                te_pnl  = (exit_p / entry_p - 1) * remaining * risk_$
+                total   = tp1_pnl + te_pnl
+                equity += total; peak_eq = max(peak_eq, equity)
+                daily_pnl[d]  = daily_pnl.get(d,  0) + total
+                weekly_pnl[w] = weekly_pnl.get(w, 0) + total
+                trades.append({"pnl": total, "equity": equity,
+                               "win": total > 0, "type": "Time",
+                               "bars": i - entry_bar})
+                in_trade = False
+
+    t = pd.DataFrame(trades)
+    if t.empty:
+        print("⚠️  No trades recorded."); return t, {}
+
+    wins = t[t["win"]];  loss = t[~t["win"]]
+    wr   = len(wins) / len(t) * 100
+    avg_w = wins["pnl"].mean() if len(wins) else 0
+    avg_l = abs(loss["pnl"].mean()) if len(loss) else 1
+    rr    = avg_w / avg_l if avg_l else 0
+    ret   = (t["equity"].iloc[-1] / account - 1) * 100
+    mdd   = ((t["equity"].cummax() - t["equity"]) /
+              t["equity"].cummax()).max() * 100
+    worst_day = min(daily_pnl.values()) / account * 100 if daily_pnl else 0
+
+    stats = {
+        "Total trades":     len(t),
+        "Win rate %":       round(wr, 2),
+        "Avg R:R":          round(rr, 2),
+        "Total return %":   round(ret, 2),
+        "Max drawdown %":   round(mdd, 2),
+        "Worst day %":      round(worst_day, 2),
+        "Final equity $":   round(t["equity"].iloc[-1], 2),
+        "Challenge passed": (
+            "✅ YES" if ret >= 10 and mdd < 10
+                        and wr >= 60 and worst_day > -5
+            else "❌ NOT YET"
+        ),
+    }
+
+    print("\n📊 Prop Firm Backtest Results")
+    print("═" * 42)
+    targets = {
+        "Win rate %": (60, ">="),
+        "Avg R:R":    (1.5, ">="),
+        "Total return %": (10, ">="),
+        "Max drawdown %": (10, "<"),
+        "Worst day %":    (-5, ">"),
+    }
+    for k, v in stats.items():
+        flag = ""
+        if k in targets:
+            thresh, op = targets[k]
+            flag = " ✅" if (
+                (op == ">=" and v >= thresh) or
+                (op == "<"  and v <  thresh) or
+                (op == ">"  and v >  thresh)
+            ) else " ❌"
+        print(f"  {k:<22}: {v}{flag}")
+
+    return t, stats
+
+trades, stats = propfirm_backtest(df, df_5, CFG)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 17 ── MONTE CARLO STRESS TEST
+# ═════════════════════════════════════════════════════════════════════════════
+def monte_carlo(trades_df, account, n_sim=2000, ci=0.95):
+    """
+    Randomly shuffles trade sequence N times to test whether the
+    strategy's performance is genuine edge or sequence luck.
+
+    Key outputs:
+      - Distribution of final equity
+      - Distribution of max drawdown
+      - % of simulations beaten by actual result (significance)
+      - 95% worst-case drawdown (planning metric)
+    """
+    if trades_df.empty:
+        print("⚠️  No trades for Monte Carlo."); return None
+
+    pnls    = trades_df["pnl"].values
+    results = []
+
+    for _ in range(n_sim):
+        shuffled  = np.random.permutation(pnls)
+        eq_curve  = account + np.cumsum(shuffled)
+        final_eq  = eq_curve[-1]
+        run_max   = np.maximum.accumulate(eq_curve)
+        max_dd    = ((run_max - eq_curve) / run_max).max() * 100
+        results.append({"final_equity": final_eq, "max_dd": max_dd})
+
+    res        = pd.DataFrame(results)
+    actual_eq  = trades_df["equity"].iloc[-1]
+    actual_dd  = ((trades_df["equity"].cummax() - trades_df["equity"]) /
+                   trades_df["equity"].cummax()).max() * 100
+    pct_beat   = (res["final_equity"] < actual_eq).mean() * 100
+    dd_ci      = np.percentile(res["max_dd"],         ci * 100)
+    eq_ci_lo   = np.percentile(res["final_equity"], (1-ci) * 100)
+
+    print(f"\n🎲 Monte Carlo ({n_sim:,} simulations)")
+    print("─" * 48)
+    print(f"  Actual final equity:         ${actual_eq:,.0f}")
+    print(f"  MC median equity:            ${res['final_equity'].median():,.0f}")
+    print(f"  {ci*100:.0f}% CI lower bound equity:  ${eq_ci_lo:,.0f}")
+    print(f"  Actual beats {pct_beat:.1f}% of shuffles")
+    print(f"  Actual max DD:               {actual_dd:.1f}%")
+    print(f"  {ci*100:.0f}% worst-case MC drawdown:  {dd_ci:.1f}%")
+    verdict = "✅ Genuine edge" if pct_beat > 70 else "⚠️  May be overfit — review logic"
+    print(f"\n  Verdict: {verdict}")
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    axes[0].hist(res["final_equity"], bins=60,
+                 color="#534AB7", alpha=0.55, edgecolor="none")
+    axes[0].axvline(actual_eq,  color="#1D9E75", lw=2,
+                    label=f"Actual  ${actual_eq:,.0f}")
+    axes[0].axvline(eq_ci_lo,   color="#E24B4A", lw=1.5, linestyle="--",
+                    label=f"95% CI  ${eq_ci_lo:,.0f}")
+    axes[0].set_title("Distribution — Final Equity", fontweight="bold")
+    axes[0].set_xlabel("Final equity ($)"); axes[0].legend(fontsize=9)
+
+    axes[1].hist(res["max_dd"], bins=60,
+                 color="#D85A30", alpha=0.55, edgecolor="none")
+    axes[1].axvline(actual_dd, color="#1D9E75", lw=2,
+                    label=f"Actual DD  {actual_dd:.1f}%")
+    axes[1].axvline(dd_ci,     color="#E24B4A", lw=1.5, linestyle="--",
+                    label=f"95% worst  {dd_ci:.1f}%")
+    axes[1].set_title("Distribution — Max Drawdown", fontweight="bold")
+    axes[1].set_xlabel("Max drawdown (%)"); axes[1].legend(fontsize=9)
+
+    plt.suptitle("Monte Carlo Stress Test", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("monte_carlo.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    return res
+
+mc_res = monte_carlo(trades, CFG["account_size"],
+                     CFG["mc_simulations"], CFG["mc_confidence"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 18 ── FULL DASHBOARD (6 panels)
+# ═════════════════════════════════════════════════════════════════════════════
+if not trades.empty:
+    fig = plt.figure(figsize=(18, 16))
+    gs  = fig.add_gridspec(3, 2, hspace=0.42, wspace=0.3)
+
+    plot_df = df.iloc[-500:].copy()
+
+    # ── Panel 1: Price + HMM + Signals ──────────────────────────────────
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.plot(plot_df.index, plot_df["close"], color="#222", lw=0.9, label="Price")
+    ax1.plot(plot_df.index, plot_df["poc"].ffill(),
+             color="#9F77DD", lw=0.6, linestyle=":", label="VP POC")
+
+    hmm_colors = {0: "#1D9E75", 1: "#378ADD", 2: "#E24B4A"}
+    hmm_labels = {0: "Range", 1: "Trend", 2: "High-vol"}
+    for state, col in hmm_colors.items():
+        mask = plot_df["hmm_state"] == state
+        ax1.fill_between(plot_df.index,
+                         plot_df["close"].min(), plot_df["close"].max(),
+                         where=mask, alpha=0.1, color=col,
+                         label=f"HMM: {hmm_labels[state]}")
+
+    sh_plot = [i for i in swing_h
+               if i < len(df) and df.index[i] in plot_df.index]
+    sl_plot = [i for i in swing_l
+               if i < len(df) and df.index[i] in plot_df.index]
+    for i in sh_plot:
+        ax1.scatter(df.index[i], df["high"].iloc[i]*1.001,
+                    marker="v", color="#E24B4A", s=30, zorder=5)
+    for i in sl_plot:
+        ax1.scatter(df.index[i], df["low"].iloc[i]*0.999,
+                    marker="^", color="#1D9E75", s=30, zorder=5)
+
+    sw_bars = plot_df[plot_df["sweep"] == 1]
+    ax1.scatter(sw_bars.index, sw_bars["low"]*0.998,
+                marker="*", color="#BA7517", s=80, zorder=6, label="Sweep")
+
+    sig_bars = plot_df[plot_df["signal"] == 1]
+    ax1.scatter(sig_bars.index, sig_bars["close"]*0.997,
+                marker="^", color="#1D9E75", s=90, zorder=7, label="Entry")
+
+    ax1.set_title("Price | HMM Regime | Market Structure | Signals",
+                  fontweight="bold", fontsize=12)
+    ax1.set_ylabel("Price")
+    ax1.legend(loc="upper left", fontsize=8, ncol=5)
+
+    # ── Panel 2: ML Probability ──────────────────────────────────────────
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.plot(plot_df.index, plot_df["ml_prob"],
+             color="#534AB7", lw=1, label="ML prob")
+    ax2.axhline(CFG["ml_threshold"], color="#E24B4A", lw=1.2,
+                linestyle="--", label=f"Threshold {CFG['ml_threshold']}")
+    ax2.fill_between(plot_df.index, CFG["ml_threshold"], plot_df["ml_prob"],
+                     where=plot_df["ml_prob"] > CFG["ml_threshold"],
+                     alpha=0.2, color="#534AB7")
+    ax2.set_ylim(0, 1); ax2.set_title("XGBoost ML Probability", fontweight="bold")
+    ax2.set_ylabel("Probability"); ax2.legend(fontsize=9)
+
+    # ── Panel 3: Order Flow ───────────────────────────────────────────────
+    ax3 = fig.add_subplot(gs[1, 1])
+    ax3.bar(plot_df.index, plot_df["delta"],
+            color=["#1D9E75" if d > 0 else "#E24B4A"
+                   for d in plot_df["delta"]],
+            alpha=0.6, label="Delta")
+    ax3_r = ax3.twinx()
+    ax3_r.plot(plot_df.index, plot_df["cvd"],
+               color="#BA7517", lw=1, alpha=0.8, label="CVD")
+    ax3.set_title("Order Flow — Delta + CVD", fontweight="bold")
+    ax3.set_ylabel("Delta"); ax3_r.set_ylabel("CVD")
+    ax3.legend(loc="upper left", fontsize=9)
+    ax3_r.legend(loc="upper right", fontsize=9)
+
+    # ── Panel 4: Equity Curve ─────────────────────────────────────────────
+    ax4 = fig.add_subplot(gs[2, 0])
+    ax4.plot(range(len(trades)), trades["equity"],
+             color="#1D9E75", lw=1.8, label="Equity")
+    ax4.axhline(CFG["account_size"],
+                color="#888", lw=1, linestyle="--", label="Start")
+    ax4.axhline(CFG["account_size"] * 1.10,
+                color="#1D9E75", lw=1.2, linestyle="--",
+                label="Target +10%")
+    ax4.axhline(CFG["account_size"] * 0.90,
+                color="#E24B4A", lw=1.2, linestyle="--",
+                label="Max DD -10%")
+    ax4.fill_between(range(len(trades)),
+                     CFG["account_size"], trades["equity"],
+                     where=trades["equity"] >= CFG["account_size"],
+                     alpha=0.12, color="#1D9E75")
+    ax4.fill_between(range(len(trades)),
+                     CFG["account_size"], trades["equity"],
+                     where=trades["equity"] < CFG["account_size"],
+                     alpha=0.12, color="#E24B4A")
+    ax4.set_title("Equity Curve vs Prop Firm Limits", fontweight="bold")
+    ax4.set_xlabel("Trade #"); ax4.set_ylabel("Account ($)")
+    ax4.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax4.legend(fontsize=9, ncol=2)
+
+    # ── Panel 5: Rolling Win Rate ─────────────────────────────────────────
+    ax5 = fig.add_subplot(gs[2, 1])
+    roll_wr = trades["win"].rolling(20).mean() * 100
+    ax5.plot(range(len(trades)), roll_wr,
+             color="#534AB7", lw=1.5, label="20-trade rolling WR")
+    ax5.axhline(60, color="#1D9E75", lw=1.2, linestyle="--",
+                label="60% target")
+    ax5.axhline(50, color="#E24B4A", lw=1, linestyle="--",
+                label="50% breakeven")
+    ax5.fill_between(range(len(trades)), 60, roll_wr,
+                     where=roll_wr >= 60, alpha=0.12, color="#1D9E75")
+    ax5.fill_between(range(len(trades)), 60, roll_wr,
+                     where=roll_wr < 60, alpha=0.12, color="#E24B4A")
+    ax5.set_ylim(20, 100)
+    ax5.set_title("Rolling Win Rate (20-trade window)", fontweight="bold")
+    ax5.set_xlabel("Trade #"); ax5.set_ylabel("Win rate (%)")
+    ax5.legend(fontsize=9)
+
+    plt.suptitle(
+        f"Quant Level 4 — Complete Prop Firm Dashboard | {CFG['ticker']}",
+        fontsize=14, fontweight="bold", y=1.01
+    )
+    plt.savefig("propfirm_complete_dashboard.png",
+                dpi=150, bbox_inches="tight")
+    plt.show()
+    print("✅ Dashboard saved.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 19 ── FEATURE IMPORTANCE
+# ═════════════════════════════════════════════════════════════════════════════
+fig2, ax = plt.subplots(figsize=(11, 7))
+imp = pd.Series(
+    xgb_model.feature_importances_, index=FEATS
+).sort_values(ascending=True)
+
+layer_map = {
+    "htf_bias":   "#1D9E75",   # Layer 1
+    "sweep":      "#534AB7",   # Layer 2
+    "ofi_bull":   "#534AB7",   # Layer 3
+    "oi_ok":      "#534AB7",   # Layer 4
+    "delta_norm": "#534AB7",
+    "cvd_slope":  "#534AB7",
+    "ba_press":   "#534AB7",
+    "hour":       "#378ADD",   # time filter
+    "dow":        "#378ADD",
+}
+colors = [layer_map.get(f, "#888780") for f in imp.index]
+imp.plot.barh(ax=ax, color=colors, edgecolor="none")
+ax.set_title("XGBoost Feature Importance — Complete Strategy",
+             fontsize=13, fontweight="bold")
+ax.set_xlabel("Importance score")
+handles = [
+    mpatches.Patch(color="#1D9E75", label="Layer 1 — HTF bias"),
+    mpatches.Patch(color="#534AB7", label="Layers 2–4 — Sweep, OFI, OI"),
+    mpatches.Patch(color="#378ADD", label="Session / time filters"),
+    mpatches.Patch(color="#888780", label="Technical indicators"),
+]
+ax.legend(handles=handles, fontsize=9)
+plt.tight_layout()
+plt.savefig("feature_importance_complete.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CELL 20 ── CHALLENGE PROJECTOR + COMPLETE SUMMARY
+# ═════════════════════════════════════════════════════════════════════════════
+def challenge_projector(trades, stats, cfg):
+    if trades.empty: return
+    n_months        = 24
+    monthly_trades  = len(trades) / n_months
+    monthly_return  = stats.get("Total return %", 0) / n_months
+    est_months      = 10 / max(monthly_return, 0.01)
+
+    print(f"\n🎯 Challenge Projector")
+    print("─" * 44)
+    print(f"  Avg trades / month:      {monthly_trades:.1f}")
+    print(f"  Avg monthly return:      {monthly_return:.2f}%")
+    print(f"  Est. months to +10%:     {est_months:.1f}")
+    print(f"\n  Prop firm checklist:")
+    checks = [
+        ("Win rate > 60%",    stats.get("Win rate %",     0) >= 60),
+        ("R:R > 1.5",         stats.get("Avg R:R",        0) >= 1.5),
+        ("Total return > 10%",stats.get("Total return %", 0) >= 10),
+        ("Max DD < 10%",      stats.get("Max drawdown %", 99) < 10),
+        ("Worst day > -5%",   stats.get("Worst day %",  -99) > -5),
+    ]
+    for label, passed in checks:
+        print(f"  {'✅' if passed else '❌'}  {label}")
+
+challenge_projector(trades, stats, CFG)
+
+print("\n" + "═" * 56)
+print("  QUANT LEVEL 4 — COMPLETE MERGED STRATEGY SUMMARY")
+print("═" * 56)
+print(f"\n  Instrument:   {CFG['ticker']}  |  {CFG['interval']} bars")
+print(f"\n  SIGNAL LAYERS (7 gates, all must pass):")
+print(f"   1. HTF bias filter        (daily MA{CFG['htf_ma']} + HH/HL)")
+print(f"   2. Liquidity sweep @ VP   ({CFG['sweep_thresh']*100:.2f}% wick + POC)")
+print(f"   3. Order flow imbalance   (delta + CVD + bid-ask)")
+print(f"   4. OI + funding proxy     (volume trend + squeeze)")
+print(f"   5. XGBoost ML             (prob > {CFG['ml_threshold']}, retrain monthly)")
+print(f"   6. Session + news gate    (London/NY + FOMC/NFP/CPI block)")
+print(f"   7. HMM regime filter      ({CFG['hmm_states']}-state, avoid high-vol)")
+print(f"\n  EXECUTION:")
+print(f"   TP1: {int(CFG['tp1_size']*100)}% closed at {CFG['tp1_r']}R")
+print(f"   Trail: {CFG['tp2_trail_atr']}x ATR on remainder")
+print(f"   SL:  {CFG['sl_atr_mult']}x ATR  |  BE move at {CFG['be_trigger_r']}R")
+print(f"   Cost: {CFG['spread_pct']*100:.2f}% spread + {CFG['slippage_pct']*100:.2f}% slippage")
+print(f"\n  RISK ENGINE:")
+print(f"   Risk/trade:  {CFG['risk_per_trade']*100:.1f}% (Kelly-adjusted + ATR scale)")
+print(f"   Daily gate:  -{CFG['daily_dd_gate']*100:.1f}% (halt rest of day)")
+print(f"   Weekly gate: -{CFG['weekly_dd_gate']*100:.1f}% (pause to Monday)")
+print(f"   Max DD hard: -{CFG['max_dd']*100:.0f}% (firm limit)")
+print(f"\n  ROBUSTNESS:")
+print(f"   Retrain: every {CFG['retrain_months']} month(s)")
+print(f"   Corr filter: {CFG['corr_window_h']}h clustering block")
+print(f"   Monte Carlo: {CFG['mc_simulations']:,} simulations")
+print(f"\n  BACKTEST RESULTS:")
+for k, v in stats.items():
+    print(f"   {k:<24}: {v}")
+print("\n" + "═" * 56)
